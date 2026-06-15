@@ -1,327 +1,338 @@
 /**
  * database.js
- * Handles all SQLite database operations using better-sqlite3.
- * All data stays local — no cloud, no telemetry.
+ * JSON-based local storage — replaces better-sqlite3.
+ *
+ * Data lives in:  <userData>/time-tracker-db.json
+ *
+ * Schema (in-memory object, flushed to disk on every write):
+ * {
+ *   activities:    Activity[],
+ *   projects:      Project[],
+ *   settings:      { [key]: string },
+ *   privacy_rules: PrivacyRule[],
+ *   _seq: { activities: number, projects: number, privacy_rules: number }
+ * }
+ *
+ * All public functions keep the same signatures as the old SQLite version so
+ * no other file needs to change.
  */
 
-const Database = require('better-sqlite3');
+'use strict';
+
+const fs   = require('fs');
 const path = require('path');
-const fs = require('fs');
 const { app } = require('electron');
 
-let db;
+// ─── In-memory store ─────────────────────────────────────────────────────────
 
-/**
- * Initialize the database. Creates tables if they don't exist.
- * Database file lives in the user's app data directory.
- */
+let dbPath = null;
+
+/** @type {{ activities: any[], projects: any[], settings: Record<string,string>, privacy_rules: any[], _seq: Record<string,number> }} */
+let store = null;
+
+// Write-debounce: batch rapid writes into one disk flush
+let flushTimer = null;
+const FLUSH_DELAY_MS = 200;
+
+const DEFAULT_STORE = () => ({
+  activities:    [],
+  projects:      [],
+  settings: {
+    tracking_interval: '5',
+    idle_timeout:      '300',
+    minimize_to_tray:  'true',
+    start_on_login:    'false',
+  },
+  privacy_rules: [],
+  _seq: { activities: 0, projects: 0, privacy_rules: 0 },
+});
+
+// ─── Disk I/O ─────────────────────────────────────────────────────────────────
+
+function loadFromDisk() {
+  try {
+    if (fs.existsSync(dbPath)) {
+      const raw = fs.readFileSync(dbPath, 'utf8');
+      const parsed = JSON.parse(raw);
+      // Merge with defaults so new keys always exist
+      store = Object.assign(DEFAULT_STORE(), parsed);
+      // Ensure _seq exists for all collections
+      store._seq = Object.assign({ activities: 0, projects: 0, privacy_rules: 0 }, parsed._seq || {});
+      // Repair sequences if data was imported without them
+      store._seq.activities    = Math.max(store._seq.activities,    maxId(store.activities));
+      store._seq.projects      = Math.max(store._seq.projects,      maxId(store.projects));
+      store._seq.privacy_rules = Math.max(store._seq.privacy_rules, maxId(store.privacy_rules));
+    } else {
+      store = DEFAULT_STORE();
+    }
+  } catch (err) {
+    console.error('[DB] Failed to load database, starting fresh:', err.message);
+    store = DEFAULT_STORE();
+  }
+}
+
+function maxId(arr) {
+  if (!arr || arr.length === 0) return 0;
+  return arr.reduce((m, r) => Math.max(m, r.id || 0), 0);
+}
+
+/** Flush store to disk (debounced). */
+function scheduleSave() {
+  clearTimeout(flushTimer);
+  flushTimer = setTimeout(flushToDisk, FLUSH_DELAY_MS);
+}
+
+/** Synchronous flush — called on app quit. */
+function flushToDisk() {
+  clearTimeout(flushTimer);
+  try {
+    const tmp = dbPath + '.tmp';
+    fs.writeFileSync(tmp, JSON.stringify(store, null, 2), 'utf8');
+    fs.renameSync(tmp, dbPath); // atomic on same filesystem
+  } catch (err) {
+    console.error('[DB] Failed to write database:', err.message);
+  }
+}
+
+/** Next auto-increment id for a collection. */
+function nextId(collection) {
+  store._seq[collection] = (store._seq[collection] || 0) + 1;
+  return store._seq[collection];
+}
+
+// ─── Init ─────────────────────────────────────────────────────────────────────
+
 function initDatabase() {
   const userDataPath = app.getPath('userData');
-  const dbPath = path.join(userDataPath, 'timetracker.db');
-
-  db = new Database(dbPath);
-
-  // Enable WAL mode for better concurrent performance
-  db.pragma('journal_mode = WAL');
-  db.pragma('foreign_keys = ON');
-
-  // Create tables
-  db.exec(`
-    CREATE TABLE IF NOT EXISTS activities (
-      id INTEGER PRIMARY KEY AUTOINCREMENT,
-      app_name TEXT,
-      window_title TEXT,
-      url TEXT,
-      domain TEXT,
-      start_time TEXT NOT NULL,
-      end_time TEXT,
-      duration_seconds INTEGER DEFAULT 0,
-      project_id INTEGER,
-      task TEXT,
-      category TEXT,
-      color TEXT,
-      is_idle INTEGER DEFAULT 0,
-      is_manual INTEGER DEFAULT 0,
-      notes TEXT,
-      created_at TEXT DEFAULT (datetime('now')),
-      updated_at TEXT DEFAULT (datetime('now')),
-      FOREIGN KEY (project_id) REFERENCES projects(id) ON DELETE SET NULL
-    );
-
-    CREATE TABLE IF NOT EXISTS projects (
-      id INTEGER PRIMARY KEY AUTOINCREMENT,
-      name TEXT NOT NULL UNIQUE,
-      color TEXT DEFAULT '#6366f1',
-      created_at TEXT DEFAULT (datetime('now'))
-    );
-
-    CREATE TABLE IF NOT EXISTS settings (
-      key TEXT PRIMARY KEY,
-      value TEXT
-    );
-
-    CREATE TABLE IF NOT EXISTS privacy_rules (
-      id INTEGER PRIMARY KEY AUTOINCREMENT,
-      type TEXT NOT NULL,
-      value TEXT NOT NULL,
-      action TEXT DEFAULT 'exclude',
-      created_at TEXT DEFAULT (datetime('now'))
-    );
-  `);
-
-  // Insert default settings if not present
-  const defaults = [
-    ['tracking_interval', '5'],
-    ['idle_timeout', '300'],
-    ['minimize_to_tray', 'true'],
-    ['start_on_login', 'false'],
-  ];
-
-  const insertSetting = db.prepare(
-    'INSERT OR IGNORE INTO settings (key, value) VALUES (?, ?)'
-  );
-  for (const [key, value] of defaults) {
-    insertSetting.run(key, value);
-  }
-
-  console.log('[DB] Database initialized at:', dbPath);
+  // Create userData directory if it doesn't exist (first run)
+  if (!fs.existsSync(userDataPath)) fs.mkdirSync(userDataPath, { recursive: true });
+  dbPath = path.join(userDataPath, 'time-tracker-db.json');
+  loadFromDisk();
+  console.log('[DB] JSON database ready at:', dbPath);
   return dbPath;
 }
 
-// ─── Activities ──────────────────────────────────────────────────────────────
+// ─── Helpers ──────────────────────────────────────────────────────────────────
+
+/** Extract YYYY-MM-DD from an ISO datetime string (handles both UTC 'Z' and local). */
+function isoDate(isoStr) {
+  if (!isoStr) return null;
+  return isoStr.slice(0, 10);
+}
+
+/** Join activity with its project fields. */
+function joinProject(activity) {
+  const project = activity.project_id
+    ? store.projects.find(p => p.id === activity.project_id) || null
+    : null;
+  return {
+    ...activity,
+    project_name:  project ? project.name  : null,
+    project_color: project ? project.color : null,
+  };
+}
+
+// ─── Activities ───────────────────────────────────────────────────────────────
 
 function getActivitiesByDate(date) {
-  // date format: YYYY-MM-DD
-  return db
-    .prepare(
-      `SELECT a.*, p.name AS project_name, p.color AS project_color
-       FROM activities a
-       LEFT JOIN projects p ON a.project_id = p.id
-       WHERE date(a.start_time) = ?
-       ORDER BY a.start_time ASC`
-    )
-    .all(date);
+  return store.activities
+    .filter(a => isoDate(a.start_time) === date)
+    .sort((a, b) => a.start_time.localeCompare(b.start_time))
+    .map(joinProject);
 }
 
 function addActivity(activity) {
-  const stmt = db.prepare(`
-    INSERT INTO activities
-      (app_name, window_title, url, domain, start_time, end_time,
-       duration_seconds, project_id, task, category, color,
-       is_idle, is_manual, notes)
-    VALUES
-      (@app_name, @window_title, @url, @domain, @start_time, @end_time,
-       @duration_seconds, @project_id, @task, @category, @color,
-       @is_idle, @is_manual, @notes)
-  `);
-  const result = stmt.run({
-    app_name: activity.app_name || null,
-    window_title: activity.window_title || null,
-    url: activity.url || null,
-    domain: activity.domain || null,
-    start_time: activity.start_time,
-    end_time: activity.end_time || null,
-    duration_seconds: activity.duration_seconds || 0,
-    project_id: activity.project_id || null,
-    task: activity.task || null,
-    category: activity.category || null,
-    color: activity.color || null,
-    is_idle: activity.is_idle ? 1 : 0,
-    is_manual: activity.is_manual ? 1 : 0,
-    notes: activity.notes || null,
-  });
-  return { id: result.lastInsertRowid, ...activity };
-}
-
-function updateActivity(id, activity) {
-  const stmt = db.prepare(`
-    UPDATE activities SET
-      app_name = @app_name,
-      window_title = @window_title,
-      url = @url,
-      domain = @domain,
-      start_time = @start_time,
-      end_time = @end_time,
-      duration_seconds = @duration_seconds,
-      project_id = @project_id,
-      task = @task,
-      category = @category,
-      color = @color,
-      is_idle = @is_idle,
-      is_manual = @is_manual,
-      notes = @notes,
-      updated_at = datetime('now')
-    WHERE id = @id
-  `);
-  stmt.run({
-    id,
-    app_name: activity.app_name || null,
-    window_title: activity.window_title || null,
-    url: activity.url || null,
-    domain: activity.domain || null,
-    start_time: activity.start_time,
-    end_time: activity.end_time || null,
-    duration_seconds: activity.duration_seconds || 0,
-    project_id: activity.project_id || null,
-    task: activity.task || null,
-    category: activity.category || null,
-    color: activity.color || null,
-    is_idle: activity.is_idle ? 1 : 0,
-    is_manual: activity.is_manual ? 1 : 0,
-    notes: activity.notes || null,
-  });
-  return getActivityById(id);
+  const now = new Date().toISOString();
+  const record = {
+    id:               nextId('activities'),
+    app_name:         activity.app_name         || null,
+    window_title:     activity.window_title      || null,
+    url:              activity.url               || null,
+    domain:           activity.domain            || null,
+    start_time:       activity.start_time,
+    end_time:         activity.end_time          || null,
+    duration_seconds: activity.duration_seconds  || 0,
+    project_id:       activity.project_id        || null,
+    task:             activity.task              || null,
+    category:         activity.category          || null,
+    color:            activity.color             || null,
+    is_idle:          activity.is_idle  ? 1 : 0,
+    is_manual:        activity.is_manual ? 1 : 0,
+    notes:            activity.notes             || null,
+    created_at:       now,
+    updated_at:       now,
+  };
+  store.activities.push(record);
+  scheduleSave();
+  return record;
 }
 
 function getActivityById(id) {
-  return db.prepare('SELECT * FROM activities WHERE id = ?').get(id);
+  return store.activities.find(a => a.id === id) || null;
+}
+
+function updateActivity(id, activity) {
+  const idx = store.activities.findIndex(a => a.id === id);
+  if (idx === -1) return null;
+  const existing = store.activities[idx];
+  store.activities[idx] = {
+    ...existing,
+    app_name:         activity.app_name         !== undefined ? activity.app_name         : existing.app_name,
+    window_title:     activity.window_title      !== undefined ? activity.window_title      : existing.window_title,
+    url:              activity.url               !== undefined ? activity.url               : existing.url,
+    domain:           activity.domain            !== undefined ? activity.domain            : existing.domain,
+    start_time:       activity.start_time        !== undefined ? activity.start_time        : existing.start_time,
+    end_time:         activity.end_time          !== undefined ? activity.end_time          : existing.end_time,
+    duration_seconds: activity.duration_seconds  !== undefined ? activity.duration_seconds  : existing.duration_seconds,
+    project_id:       activity.project_id        !== undefined ? (activity.project_id || null) : existing.project_id,
+    task:             activity.task              !== undefined ? activity.task              : existing.task,
+    category:         activity.category          !== undefined ? activity.category          : existing.category,
+    color:            activity.color             !== undefined ? activity.color             : existing.color,
+    is_idle:          activity.is_idle           !== undefined ? (activity.is_idle  ? 1 : 0) : existing.is_idle,
+    is_manual:        activity.is_manual         !== undefined ? (activity.is_manual ? 1 : 0) : existing.is_manual,
+    notes:            activity.notes             !== undefined ? activity.notes             : existing.notes,
+    updated_at:       new Date().toISOString(),
+  };
+  scheduleSave();
+  return store.activities[idx];
 }
 
 function deleteActivity(id) {
-  db.prepare('DELETE FROM activities WHERE id = ?').run(id);
+  const before = store.activities.length;
+  store.activities = store.activities.filter(a => a.id !== id);
+  if (store.activities.length !== before) scheduleSave();
   return { success: true };
 }
 
-/**
- * Split an activity block at a given time.
- * Creates two new blocks and deletes the original.
- */
 function splitActivity(id, splitTime) {
   const activity = getActivityById(id);
   if (!activity) return { error: 'Activity not found' };
 
   const start = new Date(activity.start_time);
   const split = new Date(splitTime);
-  const end = activity.end_time ? new Date(activity.end_time) : new Date();
+  const end   = activity.end_time ? new Date(activity.end_time) : new Date();
 
   if (split <= start || split >= end) {
     return { error: 'Split time must be between start and end time' };
   }
 
-  const firstDuration = Math.floor((split - start) / 1000);
-  const secondDuration = Math.floor((end - split) / 1000);
+  const firstDuration  = Math.floor((split - start) / 1000);
+  const secondDuration = Math.floor((end   - split) / 1000);
 
   const first = addActivity({
     ...activity,
     id: undefined,
-    start_time: activity.start_time,
-    end_time: splitTime,
+    start_time:       activity.start_time,
+    end_time:         splitTime,
     duration_seconds: firstDuration,
-    is_manual: 1,
+    is_manual:        1,
   });
   const second = addActivity({
     ...activity,
     id: undefined,
-    start_time: splitTime,
-    end_time: activity.end_time,
+    start_time:       splitTime,
+    end_time:         activity.end_time,
     duration_seconds: secondDuration,
-    is_manual: 1,
+    is_manual:        1,
   });
 
   deleteActivity(id);
   return { first, second };
 }
 
-/**
- * Merge multiple activity blocks into one.
- * Uses the earliest start_time and latest end_time.
- */
 function mergeActivities(ids) {
   if (!ids || ids.length < 2) return { error: 'Need at least 2 activities to merge' };
 
-  const placeholders = ids.map(() => '?').join(',');
-  const acts = db
-    .prepare(`SELECT * FROM activities WHERE id IN (${placeholders}) ORDER BY start_time ASC`)
-    .all(...ids);
+  const acts = ids
+    .map(id => getActivityById(id))
+    .filter(Boolean)
+    .sort((a, b) => a.start_time.localeCompare(b.start_time));
 
   if (acts.length < 2) return { error: 'Could not find activities' };
 
   const first = acts[0];
-  const last = acts[acts.length - 1];
+  const last  = acts[acts.length - 1];
   const start = new Date(first.start_time);
-  const end = last.end_time ? new Date(last.end_time) : new Date();
+  const end   = last.end_time ? new Date(last.end_time) : new Date();
   const duration = Math.floor((end - start) / 1000);
 
   const merged = addActivity({
     ...first,
     id: undefined,
-    end_time: last.end_time,
+    end_time:         last.end_time,
     duration_seconds: duration,
-    is_manual: 1,
-    notes: `Merged from ${ids.length} activities`,
+    is_manual:        1,
+    notes:            `Merged from ${ids.length} activities`,
   });
 
   for (const id of ids) deleteActivity(id);
   return merged;
 }
 
-// ─── Projects ────────────────────────────────────────────────────────────────
+// ─── Projects ─────────────────────────────────────────────────────────────────
 
 function getProjects() {
-  return db.prepare('SELECT * FROM projects ORDER BY name ASC').all();
+  return [...store.projects].sort((a, b) => a.name.localeCompare(b.name));
 }
 
 function addProject(project) {
-  const stmt = db.prepare(
-    'INSERT INTO projects (name, color) VALUES (@name, @color)'
-  );
-  const result = stmt.run({
-    name: project.name,
-    color: project.color || '#6366f1',
-  });
-  return { id: result.lastInsertRowid, ...project };
+  // Guard against duplicate names
+  if (store.projects.find(p => p.name === project.name)) {
+    return { error: 'A project with that name already exists' };
+  }
+  const record = {
+    id:         nextId('projects'),
+    name:       project.name,
+    color:      project.color || '#6366f1',
+    created_at: new Date().toISOString(),
+  };
+  store.projects.push(record);
+  scheduleSave();
+  return record;
 }
 
 function updateProject(id, project) {
-  db.prepare(
-    'UPDATE projects SET name = @name, color = @color WHERE id = @id'
-  ).run({ id, name: project.name, color: project.color });
-  return db.prepare('SELECT * FROM projects WHERE id = ?').get(id);
+  const idx = store.projects.findIndex(p => p.id === id);
+  if (idx === -1) return null;
+  store.projects[idx] = {
+    ...store.projects[idx],
+    name:  project.name  || store.projects[idx].name,
+    color: project.color || store.projects[idx].color,
+  };
+  scheduleSave();
+  return store.projects[idx];
 }
 
 function deleteProject(id) {
-  // Unlink activities first
-  db.prepare('UPDATE activities SET project_id = NULL WHERE project_id = ?').run(id);
-  db.prepare('DELETE FROM projects WHERE id = ?').run(id);
+  // Unlink activities that reference this project
+  store.activities = store.activities.map(a =>
+    a.project_id === id ? { ...a, project_id: null } : a
+  );
+  store.projects = store.projects.filter(p => p.id !== id);
+  scheduleSave();
   return { success: true };
 }
 
-// ─── Timesheet ───────────────────────────────────────────────────────────────
+// ─── Timesheet ────────────────────────────────────────────────────────────────
 
 function getTimesheet(startDate, endDate) {
-  const rows = db
-    .prepare(
-      `SELECT
-         a.id,
-         a.app_name,
-         a.window_title,
-         a.start_time,
-         a.end_time,
-         a.duration_seconds,
-         a.is_idle,
-         a.category,
-         a.task,
-         a.notes,
-         p.name AS project_name,
-         p.color AS project_color
-       FROM activities a
-       LEFT JOIN projects p ON a.project_id = p.id
-       WHERE date(a.start_time) BETWEEN ? AND ?
-         AND a.end_time IS NOT NULL
-       ORDER BY a.start_time ASC`
-    )
-    .all(startDate, endDate);
+  const rows = store.activities
+    .filter(a => {
+      const d = isoDate(a.start_time);
+      return d >= startDate && d <= endDate && a.end_time != null;
+    })
+    .sort((a, b) => a.start_time.localeCompare(b.start_time))
+    .map(joinProject);
 
-  // Group by project
   const grouped = {};
   for (const row of rows) {
     const key = row.project_name || 'Unassigned';
     if (!grouped[key]) {
       grouped[key] = {
-        project_name: key,
+        project_name:  key,
         project_color: row.project_color || '#94a3b8',
         total_seconds: 0,
-        activities: [],
+        activities:    [],
       };
     }
     grouped[key].total_seconds += row.duration_seconds || 0;
@@ -330,60 +341,64 @@ function getTimesheet(startDate, endDate) {
 
   return {
     rows,
-    grouped: Object.values(grouped),
+    grouped:       Object.values(grouped),
     total_seconds: rows.reduce((s, r) => s + (r.duration_seconds || 0), 0),
   };
 }
 
-// ─── Settings ────────────────────────────────────────────────────────────────
+// ─── Settings ─────────────────────────────────────────────────────────────────
 
 function getSettings() {
-  const rows = db.prepare('SELECT * FROM settings').all();
-  const settings = {};
-  for (const row of rows) settings[row.key] = row.value;
-  return settings;
+  // Return a shallow copy so callers can't mutate the store directly
+  return { ...store.settings };
 }
 
 function updateSetting(key, value) {
-  db.prepare('INSERT OR REPLACE INTO settings (key, value) VALUES (?, ?)').run(
-    key,
-    String(value)
-  );
+  store.settings[key] = String(value);
+  scheduleSave();
   return { key, value };
 }
 
-// ─── Privacy Rules ───────────────────────────────────────────────────────────
+// ─── Privacy Rules ────────────────────────────────────────────────────────────
 
 function getPrivacyRules() {
-  return db.prepare('SELECT * FROM privacy_rules ORDER BY created_at DESC').all();
+  return [...store.privacy_rules].sort((a, b) =>
+    b.created_at.localeCompare(a.created_at)
+  );
 }
 
 function addPrivacyRule(rule) {
-  const stmt = db.prepare(
-    'INSERT INTO privacy_rules (type, value, action) VALUES (@type, @value, @action)'
-  );
-  const result = stmt.run({
-    type: rule.type,
-    value: rule.value,
-    action: rule.action || 'exclude',
-  });
-  return { id: result.lastInsertRowid, ...rule };
+  const record = {
+    id:         nextId('privacy_rules'),
+    type:       rule.type,
+    value:      rule.value,
+    action:     rule.action || 'exclude',
+    created_at: new Date().toISOString(),
+  };
+  store.privacy_rules.push(record);
+  scheduleSave();
+  return record;
 }
 
 function deletePrivacyRule(id) {
-  db.prepare('DELETE FROM privacy_rules WHERE id = ?').run(id);
+  store.privacy_rules = store.privacy_rules.filter(r => r.id !== id);
+  scheduleSave();
   return { success: true };
 }
 
-// ─── Backup / Restore ────────────────────────────────────────────────────────
+// ─── Backup / Restore ─────────────────────────────────────────────────────────
 
+/** Returns the path to the JSON database file (used by exporter for backup). */
 function getDbPath() {
-  return db.name;
+  return dbPath;
 }
 
+/** Flush synchronously and release (called on app quit). */
 function closeDatabase() {
-  if (db) db.close();
+  flushToDisk();
 }
+
+// ─── Exports ──────────────────────────────────────────────────────────────────
 
 module.exports = {
   initDatabase,

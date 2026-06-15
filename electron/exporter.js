@@ -108,8 +108,8 @@ async function backupDatabase(mainWindow) {
 
   const { filePath, canceled } = await dialog.showSaveDialog(mainWindow, {
     title: 'Backup Database',
-    defaultPath: `timetracker_backup_${new Date().toISOString().slice(0, 10)}.db`,
-    filters: [{ name: 'SQLite Database', extensions: ['db'] }],
+    defaultPath: `timetracker_backup_${new Date().toISOString().slice(0, 10)}.json`,
+    filters: [{ name: 'JSON Database', extensions: ['json'] }],
   });
 
   if (canceled || !filePath) return { canceled: true };
@@ -127,7 +127,7 @@ async function restoreDatabase(mainWindow) {
 
   const { filePaths, canceled } = await dialog.showOpenDialog(mainWindow, {
     title: 'Restore Database from Backup',
-    filters: [{ name: 'SQLite Database', extensions: ['db'] }],
+    filters: [{ name: 'JSON Database', extensions: ['json'] }],
     properties: ['openFile'],
   });
 
